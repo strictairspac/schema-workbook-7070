@@ -40,6 +40,18 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 4. 3NF合成：按最小覆盖左侧分组，删除被包含关系；若无关系含候选键，补入候选键关系。无依赖时保留全属性关系。
 5. 验证：精确生成F+在各分解关系上的投影，枚举局部候选键，逐非平凡投影依赖检查3NF；所有原始依赖须可由投影并集推出。tableau追赶法依据FD合并符号，出现全a符号行则无损，报告包含见证行、合并步骤与最终表。
 
+## 受限 3NF 分表求解（表数 / 每表属性双上限）
+
+「受限分表」页在给定**表数上限 K 与每表属性数上限 M** 下，寻找满足三范式、可无损拼回、并保持全部函数依赖的分表；目标字典序为：表数最少，表数相同时重复存储属性（Σ|R_i|−|U|）最少。代码集中在 `backend/src/solver/`（纯标准库、位集表示、零外部依赖）。
+
+1. 候选表：枚举容量内全部属性子集，逐一用精确投影依赖验证 3NF，只保留「承载某条最小覆盖依赖」或「含某个候选键」的子集，其余不可能进入最优解。
+2. 分层穷举：按表数 k=1..K 逐层 DFS（候选下标严格递增），叶子统一校验覆盖全集、含键表、依赖保持与 tableau 无损。仅保留可证明安全的剪枝（容量上界、键表必要性、可接受重复量下界）；**不**把「最小覆盖依赖必须同表」作为门槛——依赖保持允许经多表投影间接推导，否则会漏判可行解。
+3. 时限与检查点：每个工作单元携带可序列化的 DFS 前沿栈。到时把未展开前沿拆成新单元落库，状态置 `waiting`（待续跑），保留已验证最好方案；续跑沿用原草案与上限，已排除组合不重复执行。只有把必要层级全部搜遍才报 `optimal`（已最优）或 `infeasible`（无解）。
+4. 并发与幂等：单元以 `(task_id, unit_key)` 唯一、行锁原子认领、租约过期可接管；事件以 `event_key` 唯一，重试/并发不重复发布；全局最优在同一事务按（表数, 重复量）合并。迟到的旧租约完成会被认领者校验拒绝。
+5. 状态机：`queued / running / waiting（待续跑）/ optimal（已最优）/ infeasible（无解）/ failed`，前端徽章与详情页明确区分后三态。队列优先 Redis，不可用时熔断降级为进程内队列；CLI（`python -m src.solver.cli`）支持无数据库的离线求解与状态文件续跑。
+
+正确性由独立暴力枚举交叉验证：随机小实例上枚举全部子集族逐一校验 3NF/依赖保持/无损，与求解器结论比对（`backend/tests/`，120+ 随机实例零不一致）。
+
 复合、循环、空决定项、无依赖均支持。不在任何RHS中的属性强制进入候选键。输入入队时冻结快照，后续修改不会改变已有报告。结果JSON含SHA256，固定输入应有固定输出。失败态包括引用关系外属性、重复/空属性、属性超过10、依赖超过64、队列错误；页面可恢复并重新执行。
 
 这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
@@ -54,9 +66,9 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 |db|MySQL8.0|JSON属性与依赖、任务报告|
 |redis|Redis7|持久任务队列|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config,solver}`；`backend/scripts/seed_demo.py`；`backend/migrations/`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。受限求解器 `backend/src/solver/{theory,search,orchestrator,runner,memory_store,search_store,cli}`，测试在 `backend/tests/`。
 
-枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
+枚举：角色admin/operator/viewer、经典分解任务queued/running/completed/failed；受限分表任务queued/running/waiting/optimal/infeasible/failed（待续跑/已最优/无解在前端徽章与详情页区分），工作单元pending/running/done/checkpointed。后端定义位于 `backend/src/constants/enums.py` 与 `backend/src/solver/solver_states.py`，前端位于 `frontend/src/constants/enums.js`；security/reports、frame/badge消费；worker持久化状态。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
 
